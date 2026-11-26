@@ -10,15 +10,17 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use peregrine_core::{
-    Agent, AgentEvent, AgentOutcome, Budgets, Guardrails, Hooks, RunStatus, SessionLog,
-    SystemSection, ToolCtx, ToolRegistry, default_session_dir, EVENT_CHANNEL_CAPACITY,
+    Agent, AgentControl, AgentError, AgentEvent, AgentOutcome, Budgets, Guardrails, Hooks,
+    Message, RunStatus, SessionLog, SystemSection, ToolCtx, ToolRegistry, default_session_dir,
+    EVENT_CHANNEL_CAPACITY,
 };
 use peregrine_llm::{ClientOptions, ProviderKind, create_client};
 use peregrine_tools::{LocalOps, register_builtin};
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -175,7 +177,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let interactive = args.prompt.is_none() && !args.print && !args.json;
     let (tx, rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
-    let mut agent = Agent::new(
+    let agent = Arc::new(Mutex::new(Agent::new(
         client,
         Arc::new(registry),
         ctx,
@@ -184,7 +186,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Guardrails::new(Budgets::default(), interactive),
         Hooks::default(),
         Some(tx),
-    );
+    )));
 
     // Session: resume or create. The log is shared with the event drain
     // task (events are appended as they arrive).
@@ -195,7 +197,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let log = SessionLog::open(&path)?;
             let replayed = peregrine_core::replay(&path)?;
             if !replayed.messages.is_empty() {
-                agent.set_messages(replayed.messages);
+                agent.lock().await.set_messages(replayed.messages);
             }
             eprintln!("resumed session {}", log.id());
             Some(Arc::new(log))
@@ -203,7 +205,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(dir)) => {
             let (log, _header) = SessionLog::create(dir, &cwd)?;
             let log = Arc::new(log);
-            for msg in agent.messages() {
+            for msg in agent.lock().await.messages() {
                 log.append_message(&msg)?;
             }
             Some(log)
@@ -211,33 +213,84 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
     };
 
+    // Shared run control: the stdin task steers and the Ctrl-C watcher
+    // aborts through this handle while a run holds the agent.
+    let control = agent.lock().await.control();
+    let running = Arc::new(AtomicBool::new(false));
+    let (exit_tx, mut exit_rx) = mpsc::channel::<()>(1);
+    {
+        let ctrl_control = control.clone();
+        let ctrl_running = running.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if ctrl_running.load(Ordering::SeqCst) {
+                    // A run is in flight: abort it. The loop reports
+                    // RunStatus::Aborted and the session is saved.
+                    ctrl_control.abort();
+                } else {
+                    // Idle: ask the REPL to quit. try_send: in one-shot
+                    // mode nobody listens, which is a harmless no-op.
+                    let _ = exit_tx.try_send(());
+                }
+            }
+        });
+    }
+
+    let one_shot = args.print || args.json || args.prompt.is_some();
     let drain_log = session_log.clone();
     let drain_json = args.json;
     let drain_interactive = interactive;
+    // In --print mode (not --json) bash chunks print live as they arrive;
+    // in interactive mode they print inline under the [tool] header.
+    let drain_print_live = one_shot && !args.json;
     // The drain task acks each AgentEnd so the REPL can wait until all
     // streamed output is flushed before printing its status line.
     let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<()>(8);
     let drain = tokio::spawn(async move {
-        drain_events(rx, drain_json, drain_interactive, drain_log, turn_done_tx).await;
+        drain_events(
+            rx,
+            drain_json,
+            drain_interactive,
+            drain_print_live,
+            drain_log,
+            turn_done_tx,
+        )
+        .await;
     });
 
-    let one_shot = args.print || args.json || args.prompt.is_some();
     if one_shot {
+        drop(exit_rx);
         let prompt = args
             .prompt
             .clone()
             .ok_or("--print/--json needs a prompt")?;
-        let before = agent.messages().len();
-        let outcome = agent.prompt(prompt).await?;
-        log_new_messages(&session_log, &agent, before)?;
+        let before = agent.lock().await.messages().len();
+        running.store(true, Ordering::SeqCst);
+        let outcome = agent.lock().await.prompt(prompt).await;
+        running.store(false, Ordering::SeqCst);
+        let outcome = outcome?;
+        let guard = agent.lock().await;
+        log_new_messages(&session_log, &guard, before)?;
         if !args.json {
-            print_final_text(&outcome, &agent);
+            print_final_text(&outcome, &guard);
         }
+        drop(guard);
         drop(agent);
         drain.await?;
         check_outcome(&outcome)?;
     } else {
-        repl(&mut agent, &session_log, &mut turn_done_rx).await?;
+        repl(
+            agent.clone(),
+            control,
+            running,
+            &session_log,
+            &mut turn_done_rx,
+            &mut exit_rx,
+        )
+        .await?;
         drop(agent);
         drain.await?;
     }
@@ -310,11 +363,13 @@ fn check_outcome(outcome: &AgentOutcome) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Drain agent events: NDJSON on stdout in `--json` mode, live rendering
-/// in interactive mode, silence (but still logged) in `--print` mode.
+/// in interactive mode, silence (but still logged) in `--print` mode —
+/// except tool output chunks, which print live in `--print` mode too.
 async fn drain_events(
     mut rx: mpsc::Receiver<AgentEvent>,
     json: bool,
     interactive: bool,
+    print_live: bool,
     log: Option<Arc<SessionLog>>,
     turn_done_tx: mpsc::Sender<()>,
 ) {
@@ -346,6 +401,10 @@ async fn drain_events(
                 AgentEvent::ToolExecutionStart { name, .. } => {
                     println!("\n[tool: {name}]");
                 }
+                AgentEvent::ToolExecutionUpdate { text, .. } => {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
                 AgentEvent::ToolExecutionEnd {
                     name, is_error, ..
                 } => {
@@ -356,6 +415,11 @@ async fn drain_events(
                 }
                 _ => {}
             }
+        } else if print_live {
+            if let AgentEvent::ToolExecutionUpdate { text, .. } = event {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
         }
         if is_end {
             let _ = turn_done_tx.try_send(());
@@ -363,50 +427,129 @@ async fn drain_events(
     }
 }
 
+/// Interactive REPL. Stdin is read on its own task, so lines typed while
+/// a run is in flight are steered into the run instead of being dropped;
+/// Ctrl-C aborts the active run (or quits at an idle prompt).
 async fn repl(
-    agent: &mut Agent,
+    agent: Arc<Mutex<Agent>>,
+    control: Arc<AgentControl>,
+    running: Arc<AtomicBool>,
     log: &Option<Arc<SessionLog>>,
     turn_done_rx: &mut mpsc::Receiver<()>,
+    exit_rx: &mut mpsc::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Peregrine {} — type /exit to quit.", VERSION);
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
-    let mut line = String::new();
+    println!("(Ctrl-C aborts the current run; text typed mid-run is steered in.)");
+    // Stdin keeps being read while a run is in flight; the REPL loop
+    // decides per line whether to start a run or steer into one.
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line_tx.send(line.trim_end().to_string()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    // The run executes on a detached task; its outcome arrives on done_rx,
+    // so the loop stays free to steer and to watch for Ctrl-C.
+    let (done_tx, mut done_rx) = mpsc::channel::<Result<AgentOutcome, AgentError>>(1);
+    let mut run_active = false;
+    let mut before = 0usize;
+    let mut exit_after_run = false;
+
     loop {
-        print!("> ");
-        std::io::stdout().flush()?;
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF
+        if !run_active {
+            print!("> ");
+            std::io::stdout().flush()?;
         }
-        let text = line.trim();
-        if text == "/exit" || text == "/quit" {
-            break;
+        tokio::select! {
+            line = line_rx.recv() => {
+                let Some(text) = line else {
+                    // EOF: quit after the active run, or now if idle.
+                    if run_active {
+                        exit_after_run = true;
+                    } else {
+                        break;
+                    }
+                    continue;
+                };
+                if run_active {
+                    if !text.is_empty() {
+                        control.steer(Message::user_text(text));
+                        println!("[steered into the running turn]");
+                    }
+                    continue;
+                }
+                if text == "/exit" || text == "/quit" {
+                    break;
+                }
+                if text.is_empty() {
+                    continue;
+                }
+                before = agent.lock().await.messages().len();
+                running.store(true, Ordering::SeqCst);
+                run_active = true;
+                let agent_clone = agent.clone();
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let mut guard = agent_clone.lock().await;
+                    let res = guard.prompt(text).await;
+                    let _ = done_tx.send(res).await;
+                });
+            }
+            res = done_rx.recv() => {
+                let Some(res) = res else {
+                    return Err("agent run ended without a result".into());
+                };
+                let outcome = res?;
+                run_active = false;
+                running.store(false, Ordering::SeqCst);
+                let guard = agent.lock().await;
+                log_new_messages(log, &guard, before)?;
+                drop(guard);
+                // Wait until the drain task has flushed every event of this turn
+                // (bounded: never block the REPL on the renderer for long).
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    turn_done_rx.recv(),
+                )
+                .await;
+                println!(
+                    "\n[{} | turns: {} | tokens: {} in / {} out]",
+                    match &outcome.status {
+                        RunStatus::Completed => "done".to_string(),
+                        other => format!("{other:?}"),
+                    },
+                    outcome.turns,
+                    outcome.usage.input_tokens,
+                    outcome.usage.output_tokens
+                );
+                if exit_after_run {
+                    break;
+                }
+            }
+            _ = exit_rx.recv() => {
+                // Ctrl-C at an idle prompt quits. It can only arrive
+                // mid-run via the race where Ctrl-C lands just as a run
+                // starts: abort the run and quit once it ends.
+                if run_active {
+                    control.abort();
+                    exit_after_run = true;
+                } else {
+                    break;
+                }
+            }
         }
-        if text.is_empty() {
-            continue;
-        }
-        let before = agent.messages().len();
-        let outcome = agent.prompt(text.to_string()).await?;
-        log_new_messages(log, agent, before)?;
-        // Wait until the drain task has flushed every event of this turn
-        // (bounded: never block the REPL on the renderer for long).
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            turn_done_rx.recv(),
-        )
-        .await;
-        println!(
-            "\n[{} | turns: {} | tokens: {} in / {} out]",
-            match &outcome.status {
-                RunStatus::Completed => "done".to_string(),
-                other => format!("{other:?}"),
-            },
-            outcome.turns,
-            outcome.usage.input_tokens,
-            outcome.usage.output_tokens
-        );
     }
     Ok(())
 }

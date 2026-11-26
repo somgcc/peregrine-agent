@@ -15,7 +15,7 @@ repository = "https://github.com/somgcc/peregrine-agent"
 authors = ["Peregrine Contributors"]
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "time", "sync", "io-util", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "time", "sync", "io-util", "io-std", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

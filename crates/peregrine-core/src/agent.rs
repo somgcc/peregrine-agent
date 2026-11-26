@@ -123,6 +123,59 @@ pub struct Hooks {
 /// Capacity of the bounded event channel.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Shared control handle for a run: the steer queue and the cancel flag.
+///
+/// The loop owns the `Agent` exclusively while a run is in flight, so the
+/// CLI cannot call `Agent::steer` (which needs `&mut self`) from another
+/// task. `AgentControl` is the escape hatch: `Agent::control()` hands out
+/// an `Arc` of it, and the CLI's stdin task / Ctrl-C watcher steer and
+/// abort through it while the run task holds the agent. The loop drains
+/// the queue at every turn boundary.
+pub struct AgentControl {
+    steer_queue: std::sync::Mutex<VecDeque<Message>>,
+    cancelled: AtomicBool,
+}
+
+impl AgentControl {
+    fn new() -> Self {
+        Self {
+            steer_queue: std::sync::Mutex::new(VecDeque::new()),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// Queue a message to be injected after the current turn.
+    pub fn steer(&self, msg: Message) {
+        self.steer_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(msg);
+    }
+
+    /// Abort the current run. The loop observes the flag between turns
+    /// and at stream poll time.
+    pub fn abort(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// True when an abort was requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn drain_steer(&self) -> Vec<Message> {
+        self.steer_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn reset_cancelled(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct Agent {
     client: Arc<dyn LlmClient>,
     tools: Arc<ToolRegistry>,
@@ -132,10 +185,9 @@ pub struct Agent {
     guardrails: Guardrails,
     hooks: Hooks,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
-    steer_queue: VecDeque<Message>,
+    control: Arc<AgentControl>,
     follow_up_queue: VecDeque<Message>,
     running: Arc<AtomicBool>,
-    cancelled: Arc<AtomicBool>,
     usage: Usage,
     turns: usize,
     tool_calls_made: AtomicUsize,
@@ -170,10 +222,9 @@ impl Agent {
             guardrails,
             hooks,
             event_tx,
-            steer_queue: VecDeque::new(),
+            control: Arc::new(AgentControl::new()),
             follow_up_queue: VecDeque::new(),
             running: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
             usage: Usage::default(),
             turns: 0,
             tool_calls_made: AtomicUsize::new(0),
@@ -202,7 +253,7 @@ impl Agent {
 
     /// Queue a message to be injected after the current turn.
     pub fn steer(&mut self, msg: Message) {
-        self.steer_queue.push_back(msg);
+        self.control.steer(msg);
     }
 
     /// Queue a message to run only when the agent would otherwise stop.
@@ -213,7 +264,18 @@ impl Agent {
     /// Abort the current run. The in-flight stream is dropped; the loop
     /// observes the flag between turns and at stream poll time.
     pub fn abort(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.control.abort();
+    }
+
+    /// The shared control handle: steer and abort from another task while
+    /// a run holds the agent. Cloned handles stay valid across runs.
+    pub fn control(&self) -> Arc<AgentControl> {
+        self.control.clone()
+    }
+
+    /// True when an abort was requested for the current run.
+    pub fn is_cancelled(&self) -> bool {
+        self.control.is_cancelled()
     }
 
     pub fn usage(&self) -> Usage {
@@ -229,7 +291,7 @@ impl Agent {
         {
             return Err(AgentError::AlreadyRunning);
         }
-        self.cancelled.store(false, Ordering::SeqCst);
+        self.control.reset_cancelled();
         self.messages.push(Message::user_text(text));
         let outcome = self.run_loop().await;
         self.running.store(false, Ordering::SeqCst);
@@ -250,7 +312,7 @@ impl Agent {
             self.running.store(false, Ordering::SeqCst);
             return Err(AgentError::NoMessages);
         }
-        self.cancelled.store(false, Ordering::SeqCst);
+        self.control.reset_cancelled();
         let outcome = self.run_loop().await;
         self.running.store(false, Ordering::SeqCst);
         Ok(outcome)
@@ -272,7 +334,7 @@ impl Agent {
     }
 
     fn drain_steer(&mut self) -> Vec<Message> {
-        self.steer_queue.drain(..).collect()
+        self.control.drain_steer()
     }
 
     fn drain_follow_up(&mut self) -> Vec<Message> {
@@ -326,7 +388,7 @@ impl Agent {
                     self.messages.append(&mut pending);
                 }
 
-                if self.cancelled.load(Ordering::SeqCst) {
+                if self.control.is_cancelled() {
                     status = RunStatus::Aborted;
                     break 'outer;
                 }
@@ -353,10 +415,16 @@ impl Agent {
                     request_messages,
                     self.tools.defs(),
                 );
+                // The turn deadline bounds the WHOLE turn: the model
+                // stream and the tool calls that follow it. A tool call
+                // gets at most the remaining turn time, and at most the
+                // per-tool budget — whichever is shorter.
                 let turn_timeout = self.guardrails.budgets.turn_timeout;
+                let turn_deadline = tokio::time::Instant::now() + turn_timeout;
 
                 self.emit(AgentEvent::MessageStart);
-                let acc = match tokio::time::timeout(turn_timeout, self.collect_stream(&req)).await
+                let acc = match tokio::time::timeout_at(turn_deadline, self.collect_stream(&req))
+                    .await
                 {
                     Ok(acc) => acc,
                     Err(_) => {
@@ -417,7 +485,9 @@ impl Agent {
                             .iter()
                             .map(|(id, name, args)| (id.as_str(), name.as_str(), args))
                             .collect();
-                        let results = self.execute_tool_calls(&call_refs).await;
+                        let results = self
+                            .execute_tool_calls(&call_refs, turn_deadline)
+                            .await;
                         for ((id, _, _), result) in owned_calls.iter().zip(results) {
                             self.messages.push(Message::ToolResult {
                                 call_id: id.clone(),
@@ -469,7 +539,7 @@ impl Agent {
         let mut stream = self.client.stream(req.clone());
         let mut acc = StreamAccumulator::new();
         while let Some(event) = stream.next().await {
-            if self.cancelled.load(Ordering::SeqCst) {
+            if self.control.is_cancelled() {
                 let _ = acc.feed(LlmEvent::Done {
                     usage: acc.usage,
                     stop_reason: StopReason::Aborted,
@@ -497,9 +567,12 @@ impl Agent {
     /// Execute one batch of tool calls: prepare sequentially (validation,
     /// guardrail evaluation, permission hook — each exactly once, in source
     /// order), execute concurrently, results in the assistant's source order.
+    /// `turn_deadline` is the wall-clock end of the turn: no tool call may
+    /// run past it, whatever the per-tool budget says.
     async fn execute_tool_calls(
         &mut self,
         calls: &[(&str, &str, &serde_json::Value)],
+        turn_deadline: tokio::time::Instant,
     ) -> Vec<ToolResult> {
         enum Prepared<'a> {
             Ready {
@@ -566,6 +639,12 @@ impl Agent {
 
         // Borrow self immutably for the concurrent phase: the async blocks
         // capture a shared reference, so the `map` closure stays `FnMut`.
+        // Each call gets the shorter of the per-tool budget and the time
+        // left in the turn, so the turn deadline bounds tool execution.
+        let tool_timeout = self.guardrails.budgets.tool_timeout;
+        let call_timeout = tool_timeout.min(
+            turn_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        );
         let this: &Agent = self;
         let futures: Vec<_> = prepared
             .iter()
@@ -573,7 +652,7 @@ impl Agent {
                 match p {
                     Prepared::Failed(result) => result.clone(),
                     Prepared::Ready { tool, name, args } => {
-                        this.execute_one(tool, name, args).await
+                        this.execute_one(tool, name, args, call_timeout).await
                     }
                 }
             })
@@ -581,13 +660,28 @@ impl Agent {
         futures::future::join_all(futures).await
     }
 
+    /// Wait until an abort is requested. Polled by tool execution so a
+    /// long tool call ends promptly on Ctrl-C instead of running to its
+    /// timeout.
+    async fn cancelled_wait(&self) {
+        loop {
+            if self.control.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// One prepared tool call: execute (concurrent with its batch), then the
-    /// after-hook. Every failure mode becomes an `is_error` result.
+    /// after-hook. Every failure mode becomes an `is_error` result. The
+    /// call is bounded by `timeout`: on expiry the tool's future is dropped
+    /// and a timeout error is returned instead of hanging the turn.
     async fn execute_one(
         &self,
         tool: &Arc<dyn crate::tool::Tool>,
         name: &str,
         args: &serde_json::Value,
+        timeout: std::time::Duration,
     ) -> ToolResult {
         let seq = self.tool_calls_made.fetch_add(1, Ordering::SeqCst);
         let event_id = format!("{name}:{seq}");
@@ -595,7 +689,35 @@ impl Agent {
             id: event_id.clone(),
             name: name.to_string(),
         });
-        let mut result = tool.execute(&self.ctx, args.clone()).await;
+        // Live output: this call's chunks go to the event channel as
+        // ToolExecutionUpdate, so the UI prints them as they arrive. The
+        // sink only try-sends — the loop never awaits the renderer.
+        let mut ctx = self.ctx.clone();
+        if let Some(tx) = self.event_tx.clone() {
+            let id = event_id.clone();
+            ctx.output_sink = Some(Arc::new(move |text: &str| {
+                let _ = tx.try_send(AgentEvent::ToolExecutionUpdate {
+                    id: id.clone(),
+                    text: text.to_string(),
+                });
+            }));
+        }
+        // The call is bounded by `timeout`, and by an abort: whichever
+        // fires first ends the call with an error result instead of
+        // hanging the turn. Dropping the tool future kills a running
+        // bash child (kill_on_drop at spawn).
+        let run = async {
+            tokio::select! {
+                result = tool.execute(&ctx, args.clone()) => result,
+                () = self.cancelled_wait() => {
+                    ToolResult::error(format!("tool {name} aborted"))
+                }
+            }
+        };
+        let mut result = match tokio::time::timeout(timeout, run).await {
+            Ok(result) => result,
+            Err(_) => ToolResult::error(format!("tool {name} timed out after {timeout:?}")),
+        };
         if let Some(hook) = &self.hooks.after_tool_call {
             if let Some(overridden) = hook(name, &result) {
                 result = overridden;
@@ -639,6 +761,8 @@ mod tests {
     use futures::stream;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     /// A scripted provider: each `stream()` call plays the next script.
     struct ScriptedClient {
@@ -747,19 +871,131 @@ mod tests {
         }
     }
 
+    /// A provider whose first stream waits at a gate before finishing,
+    /// so tests can steer / abort mid-run. Later streams return plain
+    /// text. `entered` fires when the first stream reaches the gate.
+    struct GatedClient {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        calls: Mutex<usize>,
+    }
+
+    impl GatedClient {
+        fn new(entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+            Self {
+                entered,
+                release,
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    impl LlmClient for GatedClient {
+        fn stream(
+            &self,
+            _req: LlmRequest,
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = LlmEvent> + Send + '_>> {
+            let call = {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                *n
+            };
+            if call == 1 {
+                let entered = self.entered.clone();
+                let release = self.release.clone();
+                Box::pin(stream::unfold(0u8, move |state| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        match state {
+                            0 => Some((
+                                LlmEvent::TextDelta {
+                                    text: "working".to_string(),
+                                },
+                                1,
+                            )),
+                            1 => {
+                                entered.notify_one();
+                                release.notified().await;
+                                Some((
+                                    LlmEvent::Done {
+                                        usage: Usage::default(),
+                                        stop_reason: StopReason::Stop,
+                                    },
+                                    2,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }
+                }))
+            } else {
+                Box::pin(stream::iter(vec![
+                    LlmEvent::TextDelta {
+                        text: "second turn".to_string(),
+                    },
+                    LlmEvent::Done {
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                    },
+                ]))
+            }
+        }
+    }
+
+    /// A tool that never finishes on its own (sleeps 30 s): the timeout
+    /// must cut it off, not the sleep.
+    struct SlowTool;
+
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+
+        fn description(&self) -> &str {
+            "Sleeps 30 seconds."
+        }
+
+        fn parameters(&self) -> schemars::Schema {
+            schemars::schema_for!(SlowArgs)
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolCtx,
+            _args: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                ToolResult::ok("slowly done")
+            })
+        }
+    }
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct SlowArgs {}
+
     fn test_agent(scripts: Vec<Vec<LlmEvent>>) -> Agent {
+        test_agent_full(
+            Arc::new(ScriptedClient::new(scripts)),
+            crate::guardrails::Budgets::default(),
+        )
+    }
+
+    fn test_agent_full(client: Arc<dyn LlmClient>, budgets: crate::guardrails::Budgets) -> Agent {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(FakeBash {
             output: "a.txt\nb.txt".to_string(),
         }));
+        tools.register(Arc::new(SlowTool));
         let ctx = ToolCtx::new("/tmp".into(), Arc::new(FakeOps));
         Agent::new(
-            Arc::new(ScriptedClient::new(scripts)),
+            client,
             Arc::new(tools),
             ctx,
             "mock-1".to_string(),
             vec![SystemSection::new("rules", "Be concise.")],
-            Guardrails::new(crate::guardrails::Budgets::default(), false),
+            Guardrails::new(budgets, false),
             Hooks::default(),
             None,
         )
@@ -940,5 +1176,173 @@ mod tests {
             _ => None,
         });
         assert!(result.unwrap().content.contains("no bash today"));
+    }
+
+    #[tokio::test]
+    async fn steer_mid_run_injects_message() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let client = Arc::new(GatedClient::new(entered.clone(), release.clone()));
+        let agent = test_agent_full(client, crate::guardrails::Budgets::default());
+        let control = agent.control();
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
+        let running = agent.clone();
+        let run = tokio::spawn(async move { running.lock().await.prompt("start".into()).await });
+        // The first stream is parked at the gate: steer now, while the
+        // run is in flight, through the shared control handle.
+        entered.notified().await;
+        control.steer(Message::user_text("steered in"));
+        release.notify_waiters();
+        let outcome = run.await.unwrap().unwrap();
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.turns, 2, "steered message runs a second turn");
+        let msgs = agent.lock().await.messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.text().as_deref() == Some("steered in")),
+            "steered message must reach the transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_run_aborts() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let client = Arc::new(GatedClient::new(entered.clone(), release.clone()));
+        let agent = test_agent_full(client, crate::guardrails::Budgets::default());
+        let control = agent.control();
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
+        let running = agent.clone();
+        let run = tokio::spawn(async move { running.lock().await.prompt("start".into()).await });
+        entered.notified().await;
+        control.abort();
+        release.notify_waiters();
+        let outcome = run.await.unwrap().unwrap();
+        assert_eq!(outcome.status, RunStatus::Aborted);
+        // Transcript is intact, so the CLI can save the session after
+        // an abort instead of losing the run.
+        let msgs = agent.lock().await.messages();
+        assert!(
+            msgs.iter().any(|m| m.text().as_deref() == Some("start")),
+            "aborted run keeps its transcript"
+        );
+    }
+
+    fn slow_call_script() -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallDelta {
+                id: "c1".into(),
+                name: Some("slow".into()),
+                args_delta: "{}".into(),
+            },
+            LlmEvent::Done {
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn tool_timeout_returns_error_quickly() {
+        let mut agent = test_agent_full(
+            Arc::new(ScriptedClient::new(vec![
+                slow_call_script(),
+                text_script("after slow"),
+            ])),
+            crate::guardrails::Budgets {
+                tool_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
+        );
+        let start = std::time::Instant::now();
+        let outcome = agent.prompt("go slow".to_string()).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed-out tool must return quickly, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let msgs = agent.messages();
+        let result = msgs.iter().find_map(|m| match m {
+            Message::ToolResult { result, .. } => Some(result),
+            _ => None,
+        });
+        let result = result.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn turn_timeout_bounds_tool_execution() {
+        // Tool budget is generous (60 s) but the turn ends in 200 ms:
+        // the slow tool must still error quickly, bounded by the turn
+        // deadline rather than its own budget.
+        let mut agent = test_agent_full(
+            Arc::new(ScriptedClient::new(vec![
+                slow_call_script(),
+                text_script("after slow"),
+            ])),
+            crate::guardrails::Budgets {
+                turn_timeout: Duration::from_millis(200),
+                tool_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let start = std::time::Instant::now();
+        let outcome = agent.prompt("go slow".to_string()).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "turn deadline must cut the tool off, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let msgs = agent.messages();
+        let result = msgs.iter().find_map(|m| match m {
+            Message::ToolResult { result, .. } => Some(result),
+            _ => None,
+        });
+        let result = result.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn abort_mid_tool_call_cancels_quickly() {
+        // The slow tool sleeps 30 s with a generous tool budget: an
+        // abort mid-call must end the run promptly (Aborted), not wait
+        // for the tool or its timeout.
+        let agent = test_agent_full(
+            Arc::new(ScriptedClient::new(vec![
+                slow_call_script(),
+                text_script("after slow"),
+            ])),
+            crate::guardrails::Budgets {
+                tool_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let control = agent.control();
+        let agent = Arc::new(tokio::sync::Mutex::new(agent));
+        let running = agent.clone();
+        let start = std::time::Instant::now();
+        let run = tokio::spawn(async move { running.lock().await.prompt("go slow".into()).await });
+        // Let the tool call start, then abort (as Ctrl-C would).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        control.abort();
+        let outcome = run.await.unwrap().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "aborted tool call must return quickly, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(outcome.status, RunStatus::Aborted);
+        let msgs = agent.lock().await.messages();
+        let result = msgs.iter().find_map(|m| match m {
+            Message::ToolResult { result, .. } => Some(result),
+            _ => None,
+        });
+        let result = result.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("aborted"), "{}", result.content);
     }
 }

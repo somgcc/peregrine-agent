@@ -32,7 +32,12 @@ pub struct Budgets {
     /// Maximum tool calls per session (Orca default: 100).
     pub max_tool_calls_per_session: usize,
     /// Maximum wall-clock time for one turn (Orca default: 600 s).
+    /// Bounds the whole turn — model stream AND tool execution — not
+    /// just the stream.
     pub turn_timeout: Duration,
+    /// Maximum wall-clock time for a single tool call. A call that
+    /// exceeds it returns a timeout error instead of hanging the turn.
+    pub tool_timeout: Duration,
 }
 
 impl Default for Budgets {
@@ -41,6 +46,7 @@ impl Default for Budgets {
             max_turns: 50,
             max_tool_calls_per_session: 100,
             turn_timeout: Duration::from_secs(600),
+            tool_timeout: Duration::from_secs(120),
         }
     }
 }

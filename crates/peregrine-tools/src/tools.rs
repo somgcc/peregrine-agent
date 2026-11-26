@@ -246,6 +246,10 @@ impl Tool for BashTool {
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     CmdChunk::Stdout(text) | CmdChunk::Stderr(text) => {
+                        // Live: each chunk reaches the user as it arrives
+                        // (via the ctx output sink); the full output is
+                        // still accumulated for the final result.
+                        ctx.emit_output(&text);
                         output.push_str(&text);
                     }
                     CmdChunk::Exit(code) => exit_code = Some(code),
@@ -420,6 +424,48 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(10));
         assert!(r.is_error);
         assert!(r.content.contains("killed") || r.content.contains("did not exit"));
+    }
+
+    #[tokio::test]
+    async fn bash_streams_chunks_live() {
+        // A slow command: one line every 0.3 s, ~0.9 s total. Chunks must
+        // reach the output sink as they arrive, not only at the end.
+        let dir = tempdir();
+        let chunks: Arc<std::sync::Mutex<Vec<(Duration, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_chunks = chunks.clone();
+        let start = std::time::Instant::now();
+        let sink: peregrine_core::ToolOutputSink =
+            Arc::new(move |text: &str| {
+                sink_chunks
+                    .lock()
+                    .unwrap()
+                    .push((start.elapsed(), text.to_string()));
+            });
+        let ctx = ToolCtx::new(
+            dir.path().to_path_buf(),
+            Arc::new(LocalOps::new(dir.path().to_path_buf()).unwrap()),
+        )
+        .with_output_sink(sink);
+        let r = BashTool
+            .execute(
+                &ctx,
+                serde_json::json!({"command": "for i in 1 2 3; do echo line$i; sleep 0.3; done"}),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("line1") && r.content.contains("line3"));
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 3, "one chunk per line, got: {chunks:?}");
+        assert!(
+            chunks[0].0 < Duration::from_millis(600),
+            "first chunk arrived at {:?}; the command takes ~0.9 s, so chunks must stream, not buffer",
+            chunks[0].0
+        );
+        assert!(
+            chunks[2].0 > chunks[0].0,
+            "chunks arrive spread over the run: {chunks:?}"
+        );
     }
 
     #[tokio::test]

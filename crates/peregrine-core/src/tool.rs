@@ -46,11 +46,37 @@ impl ToolResult {
 pub struct ToolCtx {
     pub cwd: std::path::PathBuf,
     pub ops: Arc<dyn Ops>,
+    /// Optional sink for live output chunks (e.g. `bash` stdout/stderr).
+    /// The agent sets one per tool call; it forwards chunks to the event
+    /// channel as `AgentEvent::ToolExecutionUpdate`. `None` (the default)
+    /// means the tool buffers silently and only the final result is seen.
+    /// The sink must never block: it is called from the tool's own task.
+    pub output_sink: Option<ToolOutputSink>,
 }
+
+/// A callback receiving one live output chunk from a running tool.
+pub type ToolOutputSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl ToolCtx {
     pub fn new(cwd: std::path::PathBuf, ops: Arc<dyn Ops>) -> Self {
-        Self { cwd, ops }
+        Self {
+            cwd,
+            ops,
+            output_sink: None,
+        }
+    }
+
+    /// Attach a live-output sink (used by the agent, per tool call).
+    pub fn with_output_sink(mut self, sink: ToolOutputSink) -> Self {
+        self.output_sink = Some(sink);
+        self
+    }
+
+    /// Emit one live output chunk, if a sink is attached. No-op otherwise.
+    pub fn emit_output(&self, text: &str) {
+        if let Some(sink) = &self.output_sink {
+            sink(text);
+        }
     }
 }
 

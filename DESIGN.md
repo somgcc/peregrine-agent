@@ -210,11 +210,12 @@ server-side at egress). Guardrails stay outside the agent.
   supports it). Stored-credential write path not implemented (read only).
 - No 16 ms render coalescing in the v0.1 REPL (deltas print as they arrive;
   coalescing is v0.2 ratatui work). No CI bench harness yet.
-- Known v0.1 gaps (fixed in v0.1.1): steering/interrupt is implemented in
-  the core (`steer()` / `cancel()`) but not wired in the CLI, so Ctrl-C and
-  mid-run input do nothing in the REPL; `bash` buffers its full output and
-  returns it at the end instead of streaming chunks live; the turn timeout
-  bounds only the model stream, not tool execution.
+- Known v0.1 gaps, fixed in v0.1.1: steering/interrupt is now wired in the
+  CLI (Ctrl-C aborts the run, mid-run input steers via `AgentControl`);
+  `bash` streams chunks live as `ToolExecutionUpdate` events instead of
+  buffering to the end; a per-tool timeout (default 120 s) bounds every
+  tool call, and the turn timeout now bounds the whole turn (model stream
+  plus tools) instead of only the stream.
 - Anthropic provider verified by unit tests only; OpenAI-compatible verified
   against a local fake SSE endpoint only (no live key used).
 

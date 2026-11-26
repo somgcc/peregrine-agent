@@ -278,6 +278,9 @@ where
 
 #[cfg(unix)]
 fn spawn_shell(cmd: &str, cwd: &Path) -> io::Result<tokio::process::Child> {
+    // kill_on_drop: if the stream is dropped (e.g. the agent's tool
+    // timeout fires), the child dies with it instead of running on
+    // orphaned in the background.
     tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -285,6 +288,7 @@ fn spawn_shell(cmd: &str, cwd: &Path) -> io::Result<tokio::process::Child> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
+        .kill_on_drop(true)
         .spawn()
 }
 
@@ -296,6 +300,7 @@ fn spawn_shell(cmd: &str, cwd: &Path) -> io::Result<tokio::process::Child> {
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
 }
 

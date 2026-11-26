@@ -13,10 +13,10 @@ pub mod session;
 pub mod tool;
 pub mod transcript;
 
-pub use agent::{Agent, AgentError, AgentEvent, AgentOutcome, BeforeToolCall, Hooks, RunStatus, TurnDecision, EVENT_CHANNEL_CAPACITY};
+pub use agent::{Agent, AgentControl, AgentError, AgentEvent, AgentOutcome, BeforeToolCall, Hooks, RunStatus, TurnDecision, EVENT_CHANNEL_CAPACITY};
 pub use guardrails::{Budgets, GuardrailAction, Guardrails, Verdict};
 pub use llm::{LlmClient, LlmEvent, LlmRequest, StopReason, Usage};
 pub use ops::{CmdChunk, Ops};
 pub use session::{SessionLog, default_session_dir, replay};
-pub use tool::{Tool, ToolCtx, ToolRegistry, ToolResult};
+pub use tool::{Tool, ToolCtx, ToolOutputSink, ToolRegistry, ToolResult};
 pub use transcript::{AssistantContent, Message, SystemSection, ToolDef, ToolLoadout, UserContent};
