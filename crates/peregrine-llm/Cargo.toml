@@ -1,0 +1,17 @@
+[package]
+name = "peregrine-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider abstraction for Peregrine: OpenAI-compatible, Anthropic, mock"
+repository.workspace = true
+
+[dependencies]
+peregrine-core.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+async-stream.workspace = true

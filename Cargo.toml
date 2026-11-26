@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/peregrine-core",
+    "crates/peregrine-llm",
+    "crates/peregrine-tools",
+    "crates/peregrine",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/somgcc/peregrine-agent"
+authors = ["Peregrine Contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "process", "time", "sync", "io-util", "io-std"] }
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+async-stream = "0.3"
+
+peregrine-core = { path = "crates/peregrine-core" }
+peregrine-llm = { path = "crates/peregrine-llm" }
+peregrine-tools = { path = "crates/peregrine-tools" }
+
+[profile.release]
+lto = true
+codegen-units = 1
